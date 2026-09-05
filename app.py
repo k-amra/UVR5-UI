@@ -159,7 +159,8 @@ roformer_models = {
     'MelBand Roformer | Aspiration by Sucial' : 'aspiration_mel_band_roformer_sdr_18.9845.ckpt',
     'MelBand Roformer | Aspiration Less Aggressive by Sucial' : 'aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt',
     'MelBand Roformer | Bleed Suppressor V1 by unwa-97chris' : 'mel_band_roformer_bleed_suppressor_v1.ckpt',
-    'BS Roformer | HyperACE V2 Voc by pcunwa' : 'bs_roformer_voc_hyperacev2.ckpt'
+    'BS Roformer | HyperACE V2 Voc by pcunwa' : 'bs_roformer_voc_hyperacev2.ckpt',
+    'MelBand Roformer | Deux by becruily' : 'becruily_deux.ckpt'
 }
 
 #=========================#

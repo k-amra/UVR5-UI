@@ -295,6 +295,10 @@
         "https://huggingface.co/pcunwa/BS-Roformer-HyperACE/resolve/main/v2_voc/bs_roformer_voc_hyperacev2.ckpt",
         "https://huggingface.co/pcunwa/BS-Roformer-HyperACE/resolve/main/v2_voc/config.yaml"
     ],
+    "MelBand Roformer | Deux by becruily": [
+        "https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main/becruily_deux.ckpt",
+        "https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main/config_deux_becruily.yaml"
+    ],
     "MDX23C_D1581.ckpt": [
         "https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/MDX23C_D1581.ckpt",
         "https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/model_2_stem_061321.yaml"
