@@ -30,19 +30,68 @@ custom_settings_file = os.path.join(now_dir, "assets", "custom_settings.json")
 #=========================#
 # Some BS-Roformer checkpoints (e.g. pcunwa/BS-Roformer-HyperACE) use a
 # SegmModel-based mask estimator that audio-separator's built-in BSRoformer
-# cannot load. Those models declare "arch: bs_roformer_hyperace" in their
-# config's model section and get routed to the vendored implementation below.
-import audio_separator.separator.architectures.mdxc_separator as _mdxc_separator
+# cannot load. Models flag themselves with "arch: bs_roformer_hyperace" in
+# their config's model section (or have "hyperace" in the checkpoint name)
+# and get routed to the vendored implementation below.
+from audio_separator.separator.roformer.roformer_loader import RoformerLoader
+from audio_separator.separator.roformer.model_loading_result import (
+    ModelLoadingResult as _ModelLoadingResult,
+)
 from assets.bs_roformer_hyperace import bs_roformer as _bs_roformer_hyperace
 
-_audio_separator_bs_roformer = _mdxc_separator.BSRoformer
+_roformer_load_model = RoformerLoader.load_model
 
-def _bs_roformer_factory(**kwargs):
-    if kwargs.pop("arch", None) == "bs_roformer_hyperace":
-        return _bs_roformer_hyperace.BSRoformer(**kwargs)
-    return _audio_separator_bs_roformer(**kwargs)
+def _roformer_load_model_wrapper(self, model_path, config, device="cpu"):
+    model_cfg = config.get("model") if isinstance(config, dict) else None
+    is_hyperace = isinstance(model_cfg, dict) and (
+        model_cfg.get("arch") == "bs_roformer_hyperace"
+        or "hyperace" in os.path.basename(str(model_path)).lower()
+    )
+    if not is_hyperace:
+        return _roformer_load_model(self, model_path, config, device)
 
-_mdxc_separator.BSRoformer = _bs_roformer_factory
+    model = _bs_roformer_hyperace.BSRoformer(
+        **{k: v for k, v in model_cfg.items() if k != "arch"}
+    )
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device).eval()
+    result = _ModelLoadingResult.success_result(model=model, config=config)
+    result.add_model_info("model_type", "bs_roformer")
+    return result
+
+RoformerLoader.load_model = _roformer_load_model_wrapper
+
+#=========================#
+#  HTTP file-serving fix  #
+#=========================#
+# Two off-by-one bugs in the pinned gradio/starlette stack break audio serving
+# with "h11 LocalProtocolError: Too much data for declared Content-Length" or
+# a hung request:
+#  1) gradio's RangedFileResponse treats the file size as an inclusive range
+#     end, so any "Range: bytes=X-Y" request with Y >= file size declares one
+#     byte too much and then loops forever at EOF.
+#  2) starlette's FileResponse multi-range responses (2+ ranges) declare one
+#     byte too few per range beyond the first, so the body outgrows the
+#     declared Content-Length.
+from gradio import ranged_response as _ranged_response
+from starlette.responses import FileResponse as _StarletteFileResponse
+
+_ranged_clamp = _ranged_response.OpenRange.clamp
+
+def _ranged_clamp_fixed(self, start, end):
+    if end <= 0 or start >= end - 1:
+        return _ranged_response.ClosedRange(0, -1)
+    return _ranged_clamp(self, start, end - 1)
+
+_ranged_response.OpenRange.clamp = _ranged_clamp_fixed
+
+_multipart_generator = _StarletteFileResponse.generate_multipart
+
+def _multipart_generator_fixed(self, ranges, boundary, max_size, content_type):
+    content_length, generator = _multipart_generator(self, ranges, boundary, max_size, content_type)
+    return content_length + 1, generator
+
+_StarletteFileResponse.generate_multipart = _multipart_generator_fixed
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 use_autocast = device == "cuda"
