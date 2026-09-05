@@ -25,6 +25,25 @@ models_file = os.path.join(now_dir, "assets", "models.json")
 default_settings_file = os.path.join(now_dir, "assets", "default_settings.json")
 custom_settings_file = os.path.join(now_dir, "assets", "custom_settings.json")
 
+#=========================#
+# HyperACE BS-Roformer    #
+#=========================#
+# Some BS-Roformer checkpoints (e.g. pcunwa/BS-Roformer-HyperACE) use a
+# SegmModel-based mask estimator that audio-separator's built-in BSRoformer
+# cannot load. Those models declare "arch: bs_roformer_hyperace" in their
+# config's model section and get routed to the vendored implementation below.
+import audio_separator.separator.architectures.mdxc_separator as _mdxc_separator
+from assets.bs_roformer_hyperace import bs_roformer as _bs_roformer_hyperace
+
+_audio_separator_bs_roformer = _mdxc_separator.BSRoformer
+
+def _bs_roformer_factory(**kwargs):
+    if kwargs.pop("arch", None) == "bs_roformer_hyperace":
+        return _bs_roformer_hyperace.BSRoformer(**kwargs)
+    return _audio_separator_bs_roformer(**kwargs)
+
+_mdxc_separator.BSRoformer = _bs_roformer_factory
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 use_autocast = device == "cuda"
 
@@ -139,7 +158,8 @@ roformer_models = {
     'BS Roformer | Male-Female by aufr33' : 'bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt',
     'MelBand Roformer | Aspiration by Sucial' : 'aspiration_mel_band_roformer_sdr_18.9845.ckpt',
     'MelBand Roformer | Aspiration Less Aggressive by Sucial' : 'aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt',
-    'MelBand Roformer | Bleed Suppressor V1 by unwa-97chris' : 'mel_band_roformer_bleed_suppressor_v1.ckpt'
+    'MelBand Roformer | Bleed Suppressor V1 by unwa-97chris' : 'mel_band_roformer_bleed_suppressor_v1.ckpt',
+    'BS Roformer | HyperACE V2 Voc by pcunwa' : 'bs_roformer_voc_hyperacev2.ckpt'
 }
 
 #=========================#
