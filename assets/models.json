@@ -295,9 +295,17 @@
         "https://huggingface.co/pcunwa/BS-Roformer-HyperACE/resolve/main/v2_voc/bs_roformer_voc_hyperacev2.ckpt",
         "https://huggingface.co/pcunwa/BS-Roformer-HyperACE/resolve/main/v2_voc/config.yaml"
     ],
+    "MelBand Roformer | Bleed Suppressor V1 by unwa-97chris": [
+        "https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_bleed_suppressor_v1.ckpt",
+        "https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_bleed_suppressor_v1.yaml"
+    ],
     "MelBand Roformer | Deux by becruily": [
         "https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main/becruily_deux.ckpt",
         "https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main/config_deux_becruily.yaml"
+    ],
+    "BS Roformer | LEAP-XE Voc by unwa": [
+        "https://huggingface.co/noblebarkrr/mvsepless_resources/resolve/main/bs_roformer/bs_leap_xe_voc_unwa.ckpt",
+        "https://huggingface.co/noblebarkrr/mvsepless_resources/resolve/main/bs_roformer/bs_leap_xe_voc_unwa_config.yaml"
     ],
     "MDX23C_D1581.ckpt": [
         "https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/MDX23C_D1581.ckpt",

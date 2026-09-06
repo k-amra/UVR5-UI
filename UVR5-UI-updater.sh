@@ -29,8 +29,16 @@ if [ ! -d ".git" ]; then
   echo "Git repository initialized."
 fi
 
+# back up user settings: config.json is tracked by git, so reset --hard would wipe it
+[ -f "assets/config.json" ] && cp "assets/config.json" "/tmp/uvr5_ui_config.json.bak"
+
 git fetch origin || error_exit "Failed to fetch updates. Check your internet connection or Git configuration."
 git reset --hard origin/main || error_exit "Failed to reset repository. Check your Git configuration or repository status."
+
+if [ -f "/tmp/uvr5_ui_config.json.bak" ]; then
+  cp "/tmp/uvr5_ui_config.json.bak" "assets/config.json"
+  rm -f "/tmp/uvr5_ui_config.json.bak"
+fi
 
 echo "Code updated successfully."
 echo

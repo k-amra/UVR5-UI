@@ -3,6 +3,7 @@ import sys
 import subprocess
 import re
 import platform
+import html
 import torch
 import logging
 import yt_dlp
@@ -10,6 +11,7 @@ import json
 import copy
 import gradio as gr
 import urllib.parse
+import urllib.request
 import assets.themes.loadThemes as loadThemes
 from audio_separator.separator import Separator
 from assets.i18n.i18n import I18nAuto
@@ -53,13 +55,73 @@ def _roformer_load_model_wrapper(self, model_path, config, device="cpu"):
     model = _bs_roformer_hyperace.BSRoformer(
         **{k: v for k, v in model_cfg.items() if k != "arch"}
     )
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    try:
+        state_dict = torch.load(model_path, map_location=device, weights_only=True)
+    except Exception:
+        # checkpoints are pickle files from the internet by nature; the
+        # weights_only fallback only runs for models surfaced by this UI
+        logging.warning(
+            "torch.load(weights_only=True) failed for %s; retrying with weights_only=False. "
+            "Only use models from sources you trust." % os.path.basename(str(model_path))
+        )
+        state_dict = torch.load(model_path, map_location=device, weights_only=False)
+    if isinstance(state_dict, dict) and "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    model.load_state_dict(state_dict)
     model.to(device).eval()
     result = _ModelLoadingResult.success_result(model=model, config=config)
     result.add_model_info("model_type", "bs_roformer")
     return result
 
 RoformerLoader.load_model = _roformer_load_model_wrapper
+
+#=========================#
+#  Custom model registry  #
+#=========================#
+# Models this UI adds on top of audio-separator's stock offering (HyperACE,
+# LEAP-XE, Deux, Bleed Suppressor, ...) are not in audio-separator's download
+# registries, so on a fresh install load_model would fail with "not found in
+# supported model files" even when the files were already downloaded manually
+# (audio-separator looks the model up unconditionally). Two pieces fix this:
+#   1) ensure_model_files() below pre-downloads everything listed for the
+#      model in assets/models.json.
+#   2) this patch injects those files (as plain filenames) into the registry
+#      so audio-separator's lookup succeeds and wires up the YAML config.
+_app_models_data = None
+
+def _load_app_models_data():
+    global _app_models_data
+    if _app_models_data is None:
+        with open(models_file, "r", encoding="utf-8") as file:
+            _app_models_data = json.load(file)
+    return _app_models_data
+
+_list_supported_model_files_orig = None
+
+def _list_supported_model_files_with_custom(self):
+    grouped = _list_supported_model_files_orig(self)
+    for friendly_name, ckpt in roformer_models.items():
+        if friendly_name in grouped["MDXC"]:
+            continue
+        urls = _load_app_models_data().get(friendly_name)
+        if not urls:
+            continue
+        filenames = [os.path.basename(urllib.parse.urlparse(url).path) for url in urls]
+        if ckpt not in filenames:
+            continue
+        grouped["MDXC"][friendly_name] = {
+            "filename": ckpt,
+            "scores": {},
+            "stems": [],
+            "target_stem": None,
+            "download_files": filenames,
+        }
+    return grouped
+
+from audio_separator.separator.separator import Separator as _SeparatorClass
+
+_list_supported_model_files_orig = _SeparatorClass.list_supported_model_files
+_SeparatorClass.list_supported_model_files = _list_supported_model_files_with_custom
 
 #=========================#
 #  HTTP file-serving fix  #
@@ -70,9 +132,22 @@ RoformerLoader.load_model = _roformer_load_model_wrapper
 #  1) gradio's RangedFileResponse treats the file size as an inclusive range
 #     end, so any "Range: bytes=X-Y" request with Y >= file size declares one
 #     byte too much and then loops forever at EOF.
-#  2) starlette's FileResponse multi-range responses (2+ ranges) declare one
-#     byte too few per range beyond the first, so the body outgrows the
-#     declared Content-Length.
+#  2) starlette's FileResponse multi-range responses declare a Content-Length
+#     one byte too small: the per-range header over-count cancels the
+#     trailing "\n" starlette sends (but doesn't declare) after each range,
+#     so the only real shortfall is the final "\n--boundary--\n" terminator.
+# Both patches depend on the internals of these exact pinned versions. If you
+# bump them, re-validate the patches and update requirements.txt together.
+import starlette
+
+if (gr.__version__ != "5.27.1" or starlette.__version__ != "0.47.3") and not os.environ.get("UVR_SKIP_PATCH_VERSION_CHECK"):
+    raise RuntimeError(
+        "gradio/starlette version changed (gradio %s, starlette %s); the ranged-response "
+        "patches in app.py must be re-validated against the new versions. Update "
+        "requirements.txt and the version check here, or set UVR_SKIP_PATCH_VERSION_CHECK=1 "
+        "to bypass." % (gr.__version__, starlette.__version__)
+    )
+
 from gradio import ranged_response as _ranged_response
 from starlette.responses import FileResponse as _StarletteFileResponse
 
@@ -103,6 +178,9 @@ if os.path.isdir("env"):
     elif platform.system() == "Linux":
         python_location = "env/bin/python"
         separator_location = "env/bin/audio-separator"
+    else:
+        python_location = None
+        separator_location = "audio-separator"
 else:
     python_location = None
     separator_location = "audio-separator"
@@ -209,6 +287,7 @@ roformer_models = {
     'MelBand Roformer | Aspiration Less Aggressive by Sucial' : 'aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt',
     'MelBand Roformer | Bleed Suppressor V1 by unwa-97chris' : 'mel_band_roformer_bleed_suppressor_v1.ckpt',
     'BS Roformer | HyperACE V2 Voc by pcunwa' : 'bs_roformer_voc_hyperacev2.ckpt',
+    'BS Roformer | LEAP-XE Voc by unwa' : 'bs_leap_xe_voc_unwa.ckpt',
     'MelBand Roformer | Deux by becruily' : 'becruily_deux.ckpt'
 }
 
@@ -323,8 +402,6 @@ output_format = [
     'ac3'
 ]
 
-found_files = []
-logs = []
 out_dir = "./outputs"
 models_dir = "./models"
 extensions = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aiff", ".ac3")
@@ -338,8 +415,6 @@ def initialize_presence():
     if load_config_presence():
         RPCManager.start_presence()
 
-initialize_presence()
-
 def download_audio(url, output_dir="ytdl"):
 
     os.makedirs(output_dir, exist_ok=True)
@@ -349,32 +424,58 @@ def download_audio(url, output_dir="ytdl"):
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'wav',
-            'preferredquality': '32',
         }],
-        'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
         'postprocessor_args': [
             '-acodec', 'pcm_f32le'
         ],
+        'outtmpl': os.path.join(output_dir, '%(title).200B [%(id)s].%(ext)s'),
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            video_title = info['title']
-
-            ydl.download([url])
-
-            file_path = os.path.join(output_dir, f"{video_title}.wav")
-
-            if os.path.exists(file_path):
-                return os.path.abspath(file_path)
-            else:
-                raise Exception("Something went wrong")
+            info = ydl.extract_info(url, download=True)
+            file_path = info.get('requested_downloads', [{}])[0].get('filepath')
+            if not file_path:
+                file_path = ydl.prepare_filename(info)
+            return os.path.abspath(file_path)
 
     except Exception as e:
-        raise Exception(f"Error extracting audio with yt-dlp: {str(e)}")
+        raise Exception(f"Error extracting audio with yt-dlp: {str(e)}") from e
+
+def ensure_model_files(model_key, model_filename):
+    """
+    Download the model and config files listed in assets/models.json for
+    model_key if they are not on disk yet. Models absent from the manifest
+    are left to audio-separator's own download registry.
+    """
+    if os.path.exists(os.path.join(models_dir, model_filename)):
+        return
+
+    urls = _load_app_models_data().get(model_key)
+    if not urls:
+        return
+
+    gr.Info(f"Downloading {model_key} (this happens only once and may take a while)...")
+    for url in urls:
+        target = os.path.join(models_dir, os.path.basename(urllib.parse.urlparse(url).path))
+        if os.path.exists(target):
+            continue
+        try:
+            with urllib.request.urlopen(url, timeout=300) as response, open(target, "wb") as file:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    file.write(chunk)
+        except Exception as e:
+            if os.path.exists(target):
+                os.remove(target)
+            logging.warning(f"Failed to download {url}: {e}. Falling back to audio-separator's own download.")
+            return
 
 def leaderboard(list_filter):
+    if not list_filter:
+        return i18n("Please select a filter first.")
     try:
         if python_location:
             command = [python_location, separator_location, "-l", f"--list_filter={list_filter}"]
@@ -391,7 +492,7 @@ def leaderboard(list_filter):
 
         return "<table border='1'>" + "".join(
             f"<tr style='{'font-weight: bold; font-size: 1.2em;' if i == 0 else ''}'>" +
-            "".join(f"<td>{cell}</td>" for cell in re.split(r"\s{2,}", line.strip())) +
+            "".join(f"<td>{html.escape(str(cell))}</td>" for cell in re.split(r"\s{2,}", line.strip())) +
             "</tr>"
             for i, line in enumerate(re.findall(r"^(?!-+)(.+)$", result.stdout.strip(), re.MULTILINE))
         ) + "</table>"
@@ -424,14 +525,14 @@ def save_lang_settings(selected_language):
         json.dump(config, file, indent=2)
 
 def alternative_model_downloader(method, key, output_dir="models", progress=gr.Progress()):
-    logs.clear()
+    logs = []
 
     with open(models_file, 'r', encoding='utf-8') as file:
         model_data = json.load(file)
-    
+
     if key not in model_data:
         return f"Model '{key}' cannot be found."
-    
+
     total_files = len(model_data[key])
     progress(0, desc="Starting downloads...")
 
@@ -446,16 +547,19 @@ def alternative_model_downloader(method, key, output_dir="models", progress=gr.P
         progress((i + 0.1) / total_files, desc=f"Starting download of {filename} ({i+1}/{total_files})")
 
         if method == 'wget':
-            cmd = ['wget', '--progress=bar:force', '-O', full_name, url]
+            cmd = ['wget', '--progress=bar:force', '--timeout=30', '--tries=3', '-O', full_name, url]
         elif method == 'curl':
-            cmd = ['curl', '-L', '-#', '-o', full_name, url]
+            cmd = ['curl', '-L', '-#', '--connect-timeout', '15', '--retry', '3', '--retry-delay', '2', '-o', full_name, url]
+        else:
+            logs.append(f"Unknown download method: {method}")
+            continue
 
         try:
             process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
+                cmd,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True,
+                text=True,
                 bufsize=1
             )
             
@@ -480,6 +584,8 @@ def alternative_model_downloader(method, key, output_dir="models", progress=gr.P
             
             process.wait()
             if process.returncode != 0:
+                if os.path.exists(full_name):
+                    os.remove(full_name)
                 logs.append(f"Error downloading {filename}")
             else:
                 logs.append(f"{filename} downloaded successfully!")
@@ -553,6 +659,8 @@ def get_all_components(components_dict):
     return all_comps
 
 def save_current_settings(*values):
+    # values arrive positionally in all_configurable_inputs order, which must
+    # keep matching the insertion order of the components dict
     global components
     try:
         current_config_data = {}
@@ -575,7 +683,7 @@ def save_current_settings(*values):
         gr.Warning(i18n("Error saving settings"))
 
 def reset_settings_to_default():
-    global components, default_settings_file
+    global components
     updates = []
     all_comps_flat = get_all_components(components)
     try:
@@ -610,10 +718,8 @@ components = {
 @track_presence("Performing BS/Mel Roformer Separation")
 def roformer_separator(audio, model_key, out_format, segment_size, override_seg_size, overlap, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress(track_tqdm=True)):
     roformer_model = roformer_models[model_key]
-    model_path = os.path.join(models_dir, roformer_model)
     try:
-        if not os.path.exists(model_path):
-            gr.Info(f"This is the first time the {model_key} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+        ensure_model_files(model_key, roformer_model)
         
         separator = Separator(
             log_level=logging.WARNING,
@@ -640,7 +746,7 @@ def roformer_separator(audio, model_key, out_format, segment_size, override_seg_
 
         stems = [os.path.join(out_dir, file_name) for file_name in separation]
 
-        if single_stem.strip():
+        if (single_stem or "").strip():
             return stems[0], None
         
         return stems[0], stems[1]
@@ -648,12 +754,10 @@ def roformer_separator(audio, model_key, out_format, segment_size, override_seg_
     except Exception as e:
         raise RuntimeError(f"Roformer separation failed: {e}") from e
 
-@track_presence("Performing MDXC Separationn")
+@track_presence("Performing MDXC Separation")
 def mdxc_separator(audio, model, out_format, segment_size, override_seg_size, overlap, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress(track_tqdm=True)):
-    model_path = os.path.join(models_dir, model)
     try:
-        if not os.path.exists(model_path):
-            gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+        ensure_model_files(model, model)
 
         separator = Separator(
             log_level=logging.WARNING,
@@ -680,7 +784,7 @@ def mdxc_separator(audio, model, out_format, segment_size, override_seg_size, ov
 
         stems = [os.path.join(out_dir, file_name) for file_name in separation]
         
-        if single_stem.strip():
+        if (single_stem or "").strip():
             return stems[0], None
         
         return stems[0], stems[1]
@@ -690,10 +794,8 @@ def mdxc_separator(audio, model, out_format, segment_size, override_seg_size, ov
 
 @track_presence("Performing MDX-NET Separation")
 def mdxnet_separator(audio, model, out_format, hop_length, segment_size, denoise, overlap, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress(track_tqdm=True)):
-    model_path = os.path.join(models_dir, model)
     try:
-        if not os.path.exists(model_path):
-            gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+        ensure_model_files(model, model)
 
         separator = Separator(
             log_level=logging.WARNING,
@@ -721,7 +823,7 @@ def mdxnet_separator(audio, model, out_format, hop_length, segment_size, denoise
 
         stems = [os.path.join(out_dir, file_name) for file_name in separation]
         
-        if single_stem.strip():
+        if (single_stem or "").strip():
             return stems[0], None
         
         return stems[0], stems[1]
@@ -731,10 +833,8 @@ def mdxnet_separator(audio, model, out_format, hop_length, segment_size, denoise
 
 @track_presence("Performing VR Arch Separation")
 def vrarch_separator(audio, model, out_format, window_size, aggression, tta, post_process, post_process_threshold, high_end_process, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress(track_tqdm=True)):
-    model_path = os.path.join(models_dir, model)
     try:
-        if not os.path.exists(model_path):
-            gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+        ensure_model_files(model, model)
 
         separator = Separator(
             log_level=logging.WARNING,
@@ -764,7 +864,7 @@ def vrarch_separator(audio, model, out_format, window_size, aggression, tta, pos
 
         stems = [os.path.join(out_dir, file_name) for file_name in separation]
         
-        if single_stem.strip():
+        if (single_stem or "").strip():
             return stems[0], None
         
         return stems[0], stems[1]
@@ -774,10 +874,8 @@ def vrarch_separator(audio, model, out_format, window_size, aggression, tta, pos
 
 @track_presence("Performing Demucs Separation")
 def demucs_separator(audio, model, out_format, shifts, segment_size, segments_enabled, overlap, batch_size, norm_thresh, amp_thresh, progress=gr.Progress(track_tqdm=True)):
-    model_path = os.path.join(models_dir, model)
     try:
-        if not os.path.exists(model_path):
-            gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+        ensure_model_files(model, model)
 
         separator = Separator(
             log_level=logging.WARNING,
@@ -820,283 +918,282 @@ def update_stems(model):
 
 @track_presence("Performing BS/Mel Roformer Batch Separation")
 def roformer_batch(path_input, path_output, model_key, out_format, segment_size, override_seg_size, overlap, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress()):
-    found_files.clear()
-    logs.clear()
+    single_stem = (single_stem or "").strip()
     roformer_model = roformer_models[model_key]
-    model_path = os.path.join(models_dir, roformer_model)
+    ensure_model_files(model_key, roformer_model)
 
-    if not os.path.exists(model_path):
-        gr.Info(f"This is the first time the {model_key} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+    if not os.path.isdir(path_input):
+        return f"Input path not found: {path_input}"
 
-    for audio_files in os.listdir(path_input):
-        if audio_files.endswith(extensions):
-            found_files.append(audio_files)
+    found_files = sorted(f for f in os.listdir(path_input) if f.endswith(extensions))
     total_files = len(found_files)
+    logs = []
 
     if total_files == 0:
         logs.append("No valid audio files.")
         return "\n".join(logs)
-    else:
-        logs.append(f"{total_files} audio files found")
-        found_files.sort()
-        progress(0, desc="Starting processing...")
 
-        for i, audio_files in enumerate(found_files):
-            progress((i / total_files), desc=f"Processing file {i+1}/{total_files}")
-            file_path = os.path.join(path_input, audio_files)
-            try:
-                separator = Separator(
-                    log_level=logging.WARNING,
-                    model_file_dir=models_dir,
-                    output_dir=path_output,
-                    output_format=out_format,
-                    use_autocast=use_autocast,
-                    normalization_threshold=norm_thresh,
-                    amplification_threshold=amp_thresh,
-                    output_single_stem=single_stem,
-                    mdxc_params={
-                        "segment_size": segment_size,
-                        "override_model_segment_size": override_seg_size,
-                        "batch_size": batch_size,
-                        "overlap": overlap,
-                    }
-                )
+    logs.append(f"{total_files} audio files found")
+    progress(0, desc="Starting processing...")
 
-                logs.append("Loading model...")
-                separator.load_model(model_filename=roformer_model)
+    # model is loaded once and reused for every file in the batch
+    separator = Separator(
+        log_level=logging.WARNING,
+        model_file_dir=models_dir,
+        output_dir=path_output,
+        output_format=out_format,
+        use_autocast=use_autocast,
+        normalization_threshold=norm_thresh,
+        amplification_threshold=amp_thresh,
+        output_single_stem=single_stem,
+        mdxc_params={
+            "segment_size": segment_size,
+            "override_model_segment_size": override_seg_size,
+            "batch_size": batch_size,
+            "overlap": overlap,
+        }
+    )
+    separator.load_model(model_filename=roformer_model)
 
-                logs.append(f"Separating file: {audio_files}")
-                separator.separate(file_path)
-                logs.append(f"File: {audio_files} separated!")
-            except Exception as e:
-                raise RuntimeError(f"BS/Mel Roformer batch separation failed: {e}") from e
-        
-        progress(1.0, desc="Processing complete")
-        return "\n".join(logs)
+    failures = 0
+    for i, audio_files in enumerate(found_files):
+        progress((i / total_files), desc=f"Processing file {i+1}/{total_files}")
+        file_path = os.path.join(path_input, audio_files)
+        try:
+            separator.separate(file_path)
+            logs.append(f"File: {audio_files} separated!")
+        except Exception as e:
+            failures += 1
+            logs.append(f"Error separating {audio_files}: {e}")
+
+    if failures:
+        logs.append(f"{failures} of {total_files} files failed to separate")
+
+    progress(1.0, desc="Processing complete")
+    return "\n".join(logs)
 
 @track_presence("Performing MDXC Batch Separation")
 def mdx23c_batch(path_input, path_output, model, out_format, segment_size, override_seg_size, overlap, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress()):
-    found_files.clear()
-    logs.clear()
-    model_path = os.path.join(models_dir, model)
+    single_stem = (single_stem or "").strip()
+    ensure_model_files(model, model)
 
-    if not os.path.exists(model_path):
-        gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+    if not os.path.isdir(path_input):
+        return f"Input path not found: {path_input}"
 
-    for audio_files in os.listdir(path_input):
-        if audio_files.endswith(extensions):
-            found_files.append(audio_files)
+    found_files = sorted(f for f in os.listdir(path_input) if f.endswith(extensions))
     total_files = len(found_files)
+    logs = []
 
     if total_files == 0:
         logs.append("No valid audio files.")
         return "\n".join(logs)
-    else:
-        logs.append(f"{total_files} audio files found")
-        found_files.sort()
-        progress(0, desc="Starting processing...")
 
-        for i, audio_files in enumerate(found_files):
-            progress((i / total_files), desc=f"Processing file {i+1}/{total_files}")
-            file_path = os.path.join(path_input, audio_files)
-            try:
-                separator = Separator(
-                    log_level=logging.WARNING,
-                    model_file_dir=models_dir,
-                    output_dir=path_output,
-                    output_format=out_format,
-                    use_autocast=use_autocast,
-                    normalization_threshold=norm_thresh,
-                    amplification_threshold=amp_thresh,
-                    output_single_stem=single_stem,
-                    mdxc_params={
-                        "segment_size": segment_size,
-                        "override_model_segment_size": override_seg_size,
-                        "batch_size": batch_size,
-                        "overlap": overlap,
-                    }
-                )
+    logs.append(f"{total_files} audio files found")
+    progress(0, desc="Starting processing...")
 
-                logs.append("Loading model...")
-                separator.load_model(model_filename=model)
+    # model is loaded once and reused for every file in the batch
+    separator = Separator(
+        log_level=logging.WARNING,
+        model_file_dir=models_dir,
+        output_dir=path_output,
+        output_format=out_format,
+        use_autocast=use_autocast,
+        normalization_threshold=norm_thresh,
+        amplification_threshold=amp_thresh,
+        output_single_stem=single_stem,
+        mdxc_params={
+            "segment_size": segment_size,
+            "override_model_segment_size": override_seg_size,
+            "batch_size": batch_size,
+            "overlap": overlap,
+        }
+    )
+    separator.load_model(model_filename=model)
 
-                logs.append(f"Separating file: {audio_files}")
-                separator.separate(file_path)
-                logs.append(f"File: {audio_files} separated!")
-            except Exception as e:
-                raise RuntimeError(f"MDXC batch separation failed: {e}") from e
-        
-        progress(1.0, desc="Processing complete")
-        return "\n".join(logs)
+    failures = 0
+    for i, audio_files in enumerate(found_files):
+        progress((i / total_files), desc=f"Processing file {i+1}/{total_files}")
+        file_path = os.path.join(path_input, audio_files)
+        try:
+            separator.separate(file_path)
+            logs.append(f"File: {audio_files} separated!")
+        except Exception as e:
+            failures += 1
+            logs.append(f"Error separating {audio_files}: {e}")
+
+    if failures:
+        logs.append(f"{failures} of {total_files} files failed to separate")
+
+    progress(1.0, desc="Processing complete")
+    return "\n".join(logs)
 
 @track_presence("Performing MDX-NET Batch Separation")
 def mdxnet_batch(path_input, path_output, model, out_format, hop_length, segment_size, denoise, overlap, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress()):
-    found_files.clear()
-    logs.clear()
-    model_path = os.path.join(models_dir, model)
+    single_stem = (single_stem or "").strip()
+    ensure_model_files(model, model)
 
-    if not os.path.exists(model_path):
-        gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+    if not os.path.isdir(path_input):
+        return f"Input path not found: {path_input}"
 
-    for audio_files in os.listdir(path_input):
-        if audio_files.endswith(extensions):
-            found_files.append(audio_files)
+    found_files = sorted(f for f in os.listdir(path_input) if f.endswith(extensions))
     total_files = len(found_files)
+    logs = []
 
     if total_files == 0:
         logs.append("No valid audio files.")
         return "\n".join(logs)
-    else:
-        logs.append(f"{total_files} audio files found")
-        found_files.sort()
-        progress(0, desc="Starting processing...")
 
-        for i, audio_files in enumerate(found_files):
-            progress((i / total_files), desc=f"Processing file {i+1}/{total_files}")
-            file_path = os.path.join(path_input, audio_files)
-            try:
-                separator = Separator(
-                    log_level=logging.WARNING,
-                    model_file_dir=models_dir,
-                    output_dir=path_output,
-                    output_format=out_format,
-                    use_autocast=use_autocast,
-                    normalization_threshold=norm_thresh,
-                    amplification_threshold=amp_thresh,
-                    output_single_stem=single_stem,
-                    mdx_params={
-                        "hop_length": hop_length,
-                        "segment_size": segment_size,
-                        "overlap": overlap,
-                        "batch_size": batch_size,
-                        "enable_denoise": denoise,
-                    }
-                )
+    logs.append(f"{total_files} audio files found")
+    progress(0, desc="Starting processing...")
 
-                logs.append("Loading model...")
-                separator.load_model(model_filename=model)
+    # model is loaded once and reused for every file in the batch
+    separator = Separator(
+        log_level=logging.WARNING,
+        model_file_dir=models_dir,
+        output_dir=path_output,
+        output_format=out_format,
+        use_autocast=use_autocast,
+        normalization_threshold=norm_thresh,
+        amplification_threshold=amp_thresh,
+        output_single_stem=single_stem,
+        mdx_params={
+            "hop_length": hop_length,
+            "segment_size": segment_size,
+            "overlap": overlap,
+            "batch_size": batch_size,
+            "enable_denoise": denoise,
+        }
+    )
+    separator.load_model(model_filename=model)
 
-                logs.append(f"Separating file: {audio_files}")
-                separator.separate(file_path)
-                logs.append(f"File: {audio_files} separated!")
-            except Exception as e:
-                raise RuntimeError(f"MDX-NET batch separation failed: {e}") from e
-            
-        progress(1.0, desc="Processing complete")
-        return "\n".join(logs)
+    failures = 0
+    for i, audio_files in enumerate(found_files):
+        progress((i / total_files), desc=f"Processing file {i+1}/{total_files}")
+        file_path = os.path.join(path_input, audio_files)
+        try:
+            separator.separate(file_path)
+            logs.append(f"File: {audio_files} separated!")
+        except Exception as e:
+            failures += 1
+            logs.append(f"Error separating {audio_files}: {e}")
+
+    if failures:
+        logs.append(f"{failures} of {total_files} files failed to separate")
+
+    progress(1.0, desc="Processing complete")
+    return "\n".join(logs)
 
 @track_presence("Performing VR Arch Batch Separation")
 def vrarch_batch(path_input, path_output, model, out_format, window_size, aggression, tta, post_process, post_process_threshold, high_end_process, batch_size, norm_thresh, amp_thresh, single_stem, progress=gr.Progress()):
-    found_files.clear()
-    logs.clear()
-    model_path = os.path.join(models_dir, model)
+    single_stem = (single_stem or "").strip()
+    ensure_model_files(model, model)
 
-    if not os.path.exists(model_path):
-        gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+    if not os.path.isdir(path_input):
+        return f"Input path not found: {path_input}"
 
-    for audio_files in os.listdir(path_input):
-        if audio_files.endswith(extensions):
-            found_files.append(audio_files)
+    found_files = sorted(f for f in os.listdir(path_input) if f.endswith(extensions))
     total_files = len(found_files)
+    logs = []
 
     if total_files == 0:
         logs.append("No valid audio files.")
         return "\n".join(logs)
-    else:
-        logs.append(f"{total_files} audio files found")
-        found_files.sort()
-        progress(0, desc="Starting processing...")
 
-        for i, audio_files in enumerate(found_files):
-            progress((i / total_files), desc=f"Processing file {i+1}/{total_files}")
-            file_path = os.path.join(path_input, audio_files)
-            try:
-                separator = Separator(
-                    log_level=logging.WARNING,
-                    model_file_dir=models_dir,
-                    output_dir=path_output,
-                    output_format=out_format,
-                    use_autocast=use_autocast,
-                    normalization_threshold=norm_thresh,
-                    amplification_threshold=amp_thresh,
-                    output_single_stem=single_stem,
-                    vr_params={
-                        "batch_size": batch_size,
-                        "window_size": window_size,
-                        "aggression": aggression,
-                        "enable_tta": tta,
-                        "enable_post_process": post_process,
-                        "post_process_threshold": post_process_threshold,
-                        "high_end_process": high_end_process,
-                    }
-                )
+    logs.append(f"{total_files} audio files found")
+    progress(0, desc="Starting processing...")
 
-                logs.append("Loading model...")
-                separator.load_model(model_filename=model)
+    # model is loaded once and reused for every file in the batch
+    separator = Separator(
+        log_level=logging.WARNING,
+        model_file_dir=models_dir,
+        output_dir=path_output,
+        output_format=out_format,
+        use_autocast=use_autocast,
+        normalization_threshold=norm_thresh,
+        amplification_threshold=amp_thresh,
+        output_single_stem=single_stem,
+        vr_params={
+            "batch_size": batch_size,
+            "window_size": window_size,
+            "aggression": aggression,
+            "enable_tta": tta,
+            "enable_post_process": post_process,
+            "post_process_threshold": post_process_threshold,
+            "high_end_process": high_end_process,
+        }
+    )
+    separator.load_model(model_filename=model)
 
-                logs.append(f"Separating file: {audio_files}")
-                separator.separate(file_path)
-                logs.append(f"File: {audio_files} separated!")
-            except Exception as e:
-                raise RuntimeError(f"VR Arch batch separation failed: {e}") from e
-            
-        progress(1.0, desc="Processing complete")
-        return "\n".join(logs)
+    failures = 0
+    for i, audio_files in enumerate(found_files):
+        progress((i / total_files), desc=f"Processing file {i+1}/{total_files}")
+        file_path = os.path.join(path_input, audio_files)
+        try:
+            separator.separate(file_path)
+            logs.append(f"File: {audio_files} separated!")
+        except Exception as e:
+            failures += 1
+            logs.append(f"Error separating {audio_files}: {e}")
+
+    if failures:
+        logs.append(f"{failures} of {total_files} files failed to separate")
+
+    progress(1.0, desc="Processing complete")
+    return "\n".join(logs)
 
 @track_presence("Performing Demucs Batch Separation")
 def demucs_batch(path_input, path_output, model, out_format, shifts, segment_size, segments_enabled, overlap, batch_size, norm_thresh, amp_thresh, progress=gr.Progress()):
-    found_files.clear()
-    logs.clear()
-    model_path = os.path.join(models_dir, model)
+    ensure_model_files(model, model)
 
-    if not os.path.exists(model_path):
-        gr.Info(f"This is the first time the {model} model is being used. The separation will take a little longer because the model needs to be downloaded.")
+    if not os.path.isdir(path_input):
+        return f"Input path not found: {path_input}"
 
-    for audio_files in os.listdir(path_input):
-        if audio_files.endswith(extensions):
-            found_files.append(audio_files)
+    found_files = sorted(f for f in os.listdir(path_input) if f.endswith(extensions))
     total_files = len(found_files)
+    logs = []
 
     if total_files == 0:
         logs.append("No valid audio files.")
         return "\n".join(logs)
-    else:
-        logs.append(f"{total_files} audio files found")
-        found_files.sort()
-        progress(0, desc="Starting processing...")
 
-        for i, audio_files in enumerate(found_files):
-            progress((i / total_files), desc=f"Processing file {i+1}/{total_files}")
-            file_path = os.path.join(path_input, audio_files)
-            try:
-                separator = Separator(
-                    log_level=logging.WARNING,
-                    model_file_dir=models_dir,
-                    output_dir=path_output,
-                    output_format=out_format,
-                    use_autocast=use_autocast,
-                    normalization_threshold=norm_thresh,
-                    amplification_threshold=amp_thresh,
-                    demucs_params={
-                        "batch_size": batch_size,
-                        "segment_size": segment_size,
-                        "shifts": shifts,
-                        "overlap": overlap,
-                        "segments_enabled": segments_enabled,
-                    }
-                )
+    logs.append(f"{total_files} audio files found")
+    progress(0, desc="Starting processing...")
 
-                logs.append("Loading model...")
-                separator.load_model(model_filename=model)
+    # model is loaded once and reused for every file in the batch
+    separator = Separator(
+        log_level=logging.WARNING,
+        model_file_dir=models_dir,
+        output_dir=path_output,
+        output_format=out_format,
+        use_autocast=use_autocast,
+        normalization_threshold=norm_thresh,
+        amplification_threshold=amp_thresh,
+        demucs_params={
+            "batch_size": batch_size,
+            "segment_size": segment_size,
+            "shifts": shifts,
+            "overlap": overlap,
+            "segments_enabled": segments_enabled,
+        }
+    )
+    separator.load_model(model_filename=model)
 
-                logs.append(f"Separating file: {audio_files}")
-                separator.separate(file_path)
-                logs.append(f"File: {audio_files} separated!")
-            except Exception as e:
-                raise RuntimeError(f"Demucs batch separation failed: {e}") from e
-            
-        progress(1.0, desc="Processing complete")
-        return "\n".join(logs)
+    failures = 0
+    for i, audio_files in enumerate(found_files):
+        progress((i / total_files), desc=f"Processing file {i+1}/{total_files}")
+        file_path = os.path.join(path_input, audio_files)
+        try:
+            separator.separate(file_path)
+            logs.append(f"File: {audio_files} separated!")
+        except Exception as e:
+            failures += 1
+            logs.append(f"Error separating {audio_files}: {e}")
+
+    if failures:
+        logs.append(f"{failures} of {total_files} files failed to separate")
+
+    progress(1.0, desc="Processing complete")
+    return "\n".join(logs)
             
 with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 UVR5 UI 🎵") as app:
     gr.Markdown("<h1> 🎵 UVR5 UI 🎵 </h1>")
@@ -1231,14 +1328,14 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                         interactive = True
                     )
                 with gr.Row():
-                    roformer_bath_button = gr.Button(i18n("Separate!"), variant = "primary")
+                    roformer_batch_button = gr.Button(i18n("Separate!"), variant = "primary")
                 with gr.Row():
                     roformer_info = gr.Textbox(
                         label = i18n("Output information"),
                         interactive = False
                     )
 
-            roformer_bath_button.click(roformer_batch, [roformer_input_path, roformer_output_path, roformer_model, roformer_output_format, roformer_segment_size, roformer_override_segment_size, roformer_overlap, roformer_batch_size, roformer_normalization_threshold, roformer_amplification_threshold, roformer_single_stem], [roformer_info])
+            roformer_batch_button.click(roformer_batch, [roformer_input_path, roformer_output_path, roformer_model, roformer_output_format, roformer_segment_size, roformer_override_segment_size, roformer_overlap, roformer_batch_size, roformer_normalization_threshold, roformer_amplification_threshold, roformer_single_stem], [roformer_info])
 
             with gr.Row():
                 roformer_button = gr.Button(i18n("Separate!"), variant = "primary")
@@ -1385,14 +1482,14 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                         interactive = True
                     )
                 with gr.Row():
-                    mdx23c_bath_button = gr.Button(i18n("Separate!"), variant = "primary")
+                    mdx23c_batch_button = gr.Button(i18n("Separate!"), variant = "primary")
                 with gr.Row():
                     mdx23c_info = gr.Textbox(
                         label = i18n("Output information"),
                         interactive = False
                     )
 
-            mdx23c_bath_button.click(mdx23c_batch, [mdx23c_input_path, mdx23c_output_path, mdx23c_model, mdx23c_output_format, mdx23c_segment_size, mdx23c_override_segment_size, mdx23c_overlap, mdx23c_batch_size, mdx23c_normalization_threshold, mdx23c_amplification_threshold, mdx23c_single_stem], [mdx23c_info])
+            mdx23c_batch_button.click(mdx23c_batch, [mdx23c_input_path, mdx23c_output_path, mdx23c_model, mdx23c_output_format, mdx23c_segment_size, mdx23c_override_segment_size, mdx23c_overlap, mdx23c_batch_size, mdx23c_normalization_threshold, mdx23c_amplification_threshold, mdx23c_single_stem], [mdx23c_info])
 
             with gr.Row():
                 mdx23c_button = gr.Button(i18n("Separate!"), variant = "primary")
@@ -1549,14 +1646,14 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                         interactive = True
                     )
                 with gr.Row():
-                    mdxnet_bath_button = gr.Button(i18n("Separate!"), variant = "primary")
+                    mdxnet_batch_button = gr.Button(i18n("Separate!"), variant = "primary")
                 with gr.Row():
                     mdxnet_info = gr.Textbox(
                         label = i18n("Output information"),
                         interactive = False
                     )
 
-            mdxnet_bath_button.click(mdxnet_batch, [mdxnet_input_path, mdxnet_output_path, mdxnet_model, mdxnet_output_format, mdxnet_hop_length, mdxnet_segment_size, mdxnet_denoise, mdxnet_overlap, mdxnet_batch_size, mdxnet_normalization_threshold, mdxnet_amplification_threshold, mdxnet_single_stem], [mdxnet_info])
+            mdxnet_batch_button.click(mdxnet_batch, [mdxnet_input_path, mdxnet_output_path, mdxnet_model, mdxnet_output_format, mdxnet_hop_length, mdxnet_segment_size, mdxnet_denoise, mdxnet_overlap, mdxnet_batch_size, mdxnet_normalization_threshold, mdxnet_amplification_threshold, mdxnet_single_stem], [mdxnet_info])
 
             with gr.Row():
                 mdxnet_button = gr.Button(i18n("Separate!"), variant = "primary")
@@ -1731,14 +1828,14 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                         interactive = True
                     )
                 with gr.Row():
-                    vrarch_bath_button = gr.Button(i18n("Separate!"), variant = "primary")
+                    vrarch_batch_button = gr.Button(i18n("Separate!"), variant = "primary")
                 with gr.Row():
                     vrarch_info = gr.Textbox(
                         label = i18n("Output information"),
                         interactive = False
                     )
 
-            vrarch_bath_button.click(vrarch_batch, [vrarch_input_path, vrarch_output_path, vrarch_model, vrarch_output_format, vrarch_window_size, vrarch_agression, vrarch_tta, vrarch_post_process, vrarch_post_process_threshold, vrarch_high_end_process, vrarch_batch_size, vrarch_normalization_threshold, vrarch_amplification_threshold, vrarch_single_stem], [vrarch_info])
+            vrarch_batch_button.click(vrarch_batch, [vrarch_input_path, vrarch_output_path, vrarch_model, vrarch_output_format, vrarch_window_size, vrarch_agression, vrarch_tta, vrarch_post_process, vrarch_post_process_threshold, vrarch_high_end_process, vrarch_batch_size, vrarch_normalization_threshold, vrarch_amplification_threshold, vrarch_single_stem], [vrarch_info])
 
             with gr.Row():
                 vrarch_button = gr.Button(i18n("Separate!"), variant = "primary")
@@ -1887,14 +1984,14 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                         interactive = True
                     )
                 with gr.Row():
-                    demucs_bath_button = gr.Button(i18n("Separate!"), variant = "primary")
+                    demucs_batch_button = gr.Button(i18n("Separate!"), variant = "primary")
                 with gr.Row():
                     demucs_info = gr.Textbox(
                         label = i18n("Output information"),
                         interactive = False
                     )
 
-            demucs_bath_button.click(demucs_batch, [demucs_input_path, demucs_output_path, demucs_model, demucs_output_format, demucs_shifts, demucs_segment_size, demucs_segments_enabled, demucs_overlap, demucs_batch_size, demucs_normalization_threshold, demucs_amplification_threshold], [demucs_info])
+            demucs_batch_button.click(demucs_batch, [demucs_input_path, demucs_output_path, demucs_model, demucs_output_format, demucs_shifts, demucs_segment_size, demucs_segments_enabled, demucs_overlap, demucs_batch_size, demucs_normalization_threshold, demucs_amplification_threshold], [demucs_info])
 
             with gr.Row():
                 demucs_button = gr.Button(i18n("Separate!"), variant = "primary")
@@ -1924,7 +2021,7 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                     type = "filepath",
                     label = i18n("Stem 4")
                 )
-            with gr.Row(visible=False) as stem6:
+            with gr.Row(visible=False) as row_stem5_6:
                 demucs_stem5 = gr.Audio(
                     show_download_button = True,
                     interactive = False,
@@ -1938,7 +2035,7 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                     label = i18n("Stem 6")
                 )
 
-            demucs_model.change(update_stems, inputs=[demucs_model], outputs=stem6)
+            demucs_model.change(update_stems, inputs=[demucs_model], outputs=row_stem5_6)
                 
             demucs_button.click(demucs_separator, [demucs_audio, demucs_model, demucs_output_format, demucs_shifts, demucs_segment_size, demucs_segments_enabled, demucs_overlap, demucs_batch_size, demucs_normalization_threshold, demucs_amplification_threshold], [demucs_stem1, demucs_stem2, demucs_stem3, demucs_stem4, demucs_stem5, demucs_stem6])
 
@@ -2038,10 +2135,14 @@ with gr.Blocks(theme = loadThemes.load_json() or "NoCrypt/miku", title = "🎵 U
                 """
             )
 
-app.launch(
-    share=args.share,
-    favicon_path="assets/favicon.ico",
-    server_name="",
-    server_port=args.listen_port,
-    inbrowser=args.open
-)
+if __name__ == "__main__":
+    initialize_presence()
+    # server_name="" binds all interfaces: needed for Hugging Face Spaces and
+    # --share-style hosting; set 127.0.0.1 here if you only want local access
+    app.launch(
+        share=args.share,
+        favicon_path="assets/favicon.ico",
+        server_name="",
+        server_port=args.listen_port,
+        inbrowser=args.open
+    )

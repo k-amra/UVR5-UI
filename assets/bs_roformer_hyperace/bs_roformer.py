@@ -1,7 +1,8 @@
 # BS-Roformer implementation with the HyperACE (SegmModel-based) mask estimator,
 # vendored from pcunwa/BS-Roformer-HyperACE (v2_voc/bs_roformer.py, MSST-style).
 # Only changes vs. upstream: relative .attend import and removal of the unused
-# torchaudio / sage-attention imports (sage_attention stays False here).
+# torchaudio / sage-attention imports (sage_attention is rejected explicitly,
+# since AttendSage no longer exists in this vendored build).
 
 from functools import partial
 
@@ -96,9 +97,8 @@ class Attention(Module):
         self.rotary_embed = rotary_embed
 
         if sage_attention:
-            self.attend = AttendSage(flash=flash, dropout=dropout)
-        else:
-            self.attend = Attend(flash=flash, dropout=dropout)
+            raise NotImplementedError("sage_attention is not supported in this vendored build")
+        self.attend = Attend(flash=flash, dropout=dropout)
 
         self.norm = RMSNorm(dim)
         self.to_qkv = nn.Linear(dim, dim_inner * 3, bias=False)
@@ -157,17 +157,12 @@ class LinearAttention(Module):
         self.temperature = nn.Parameter(torch.ones(heads, 1, 1))
 
         if sage_attention:
-            self.attend = AttendSage(
-                scale=scale,
-                dropout=dropout,
-                flash=flash
-            )
-        else:
-            self.attend = Attend(
-                scale=scale,
-                dropout=dropout,
-                flash=flash
-            )
+            raise NotImplementedError("sage_attention is not supported in this vendored build")
+        self.attend = Attend(
+            scale=scale,
+            dropout=dropout,
+            flash=flash
+        )
 
         self.to_out = nn.Sequential(
             Rearrange('b h d n -> b n (h d)'),
@@ -965,7 +960,7 @@ class BSRoformer(Module):
         # Since it's tedious to define whether we're on correct MacOS version - simple try-catch is used
         try:
             stft_repr = torch.stft(raw_audio, **self.stft_kwargs, window=stft_window, return_complex=True)
-        except:
+        except RuntimeError:
             stft_repr = torch.stft(raw_audio.cpu() if x_is_mps else raw_audio, **self.stft_kwargs,
                                    window=stft_window.cpu() if x_is_mps else stft_window, return_complex=True).to(
                 device)
@@ -1028,7 +1023,7 @@ class BSRoformer(Module):
 
         try:
             recon_audio = torch.istft(stft_repr, **self.stft_kwargs, window=stft_window, return_complex=False, length=raw_audio.shape[-1])
-        except:
+        except RuntimeError:
             recon_audio = torch.istft(stft_repr.cpu() if x_is_mps else stft_repr, **self.stft_kwargs, window=stft_window.cpu() if x_is_mps else stft_window, return_complex=False, length=raw_audio.shape[-1]).to(device)
 
         recon_audio = rearrange(recon_audio, '(b n s) t -> b n s t', s=self.audio_channels, n=num_stems)

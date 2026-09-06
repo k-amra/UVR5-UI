@@ -51,7 +51,7 @@
     "Amplification threshold": "Verstärkungsschwelle",
     "The threshold for audio amplification": "Die Schwelle für die Audioverstärkung",
     "Hop length": "Sprunglänge",
-    "Usually called stride in neural networks; only change if you know what you're doing" : "In neuronalen Netzen обычно шаг genannt; Ändern Sie dies nur, wenn Sie wissen, was Sie tun",
+    "Usually called stride in neural networks; only change if you know what you're doing": "In neuronalen Netzen meist als „Stride“ bezeichnet; Ändern Sie dies nur, wenn Sie wissen, was Sie tun",
     "Balance quality and speed. 1024 = fast but lower, 320 = slower but better quality": "Gleichgewicht zwischen Qualität und Geschwindigkeit. 1024 = schnell, aber geringere Qualität, 320 = langsamer, aber bessere Qualität",
     "Identify leftover artifacts within vocal output; may improve separation for some songs": "Identifizieren Sie verbleibende Artefakte in der Gesangsausgabe; kann die Trennung für einige Lieder verbessern",
     "Post process": "Nachbearbeitung",

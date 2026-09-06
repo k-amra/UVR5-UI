@@ -26,11 +26,19 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+rem back up user settings: config.json is tracked by git, so reset --hard would wipe it
+if exist "assets\config.json" copy /y "assets\config.json" "%TEMP%\uvr5_ui_config.json.bak" >nul 2>&1
+
 git reset --hard origin/main
 if %errorlevel% neq 0 (
     echo Error: Failed to reset repository. Check your Git configuration or repository status.
     pause
     exit /b 1
+)
+
+if exist "%TEMP%\uvr5_ui_config.json.bak" (
+    copy /y "%TEMP%\uvr5_ui_config.json.bak" "assets\config.json" >nul
+    del "%TEMP%\uvr5_ui_config.json.bak" >nul 2>&1
 )
 
 echo Code updated successfully.

@@ -24,7 +24,7 @@ class RichPresenceManager:
                 "small_text": "BS/Mel Roformer"
             },
             # MDXC
-            "Performing MDXC Separationn": {
+            "Performing MDXC Separation": {
                 "small_image": "mdxc",
                 "small_text": "MDXC"
             },
