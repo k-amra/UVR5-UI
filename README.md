@@ -45,6 +45,30 @@ You can also try it on HuggingFace Spaces running with Zero GPU (A100)!
 * Colab/Kaggle/Lightning.ai support
 * Windows/Linux support
 
+## Changes in this fork
+
+This repository is a fork of [Eddycrack864/UVR5-UI](https://github.com/Eddycrack864/UVR5-UI) with the following changes on top of upstream. Check the upstream repo for the latest base changes and official support.
+
+### Extra models
+* **BS Roformer | HyperACE V2 Voc by pcunwa** — uses a SegmModel-based mask estimator that stock audio-separator cannot load. A vendored implementation ships in `assets/bs_roformer_hyperace/` and is selected automatically via the model config's `arch` flag (or "hyperace" in the checkpoint name).
+* **MelBand Roformer | Deux by becruily** (dual vocals/instrumental)
+* **BS Roformer | LEAP-XE Voc by unwa**
+* **MelBand Roformer | Bleed Suppressor V1 by unwa-97chris** (download URLs added)
+
+### Auto-download for fork-added models
+Models added by this fork are not in audio-separator's own download registry, so on a clean install they failed with "not found in supported model files" even after a manual download. The UI now downloads the model and its config from `assets/models.json` before separation and registers them with audio-separator, so first use works out of the box.
+
+### Fixed audio streaming of separated stems
+The pinned gradio/starlette stack has two off-by-one bugs in ranged HTTP file responses that break or hang audio playback of results ("h11 ... Content-Length" errors). This fork patches both and asserts the pinned versions (gradio 5.27.1 / starlette 0.47.3). Starting with different versions fails loudly with instructions; the check can be bypassed with `UVR_SKIP_PATCH_VERSION_CHECK=1`.
+
+### Robustness fixes
+* Batch separation loads the model once per batch instead of per file, continues after a failed file (with a per-file error report), and no longer shares global state between concurrent runs
+* The updater scripts back up and restore `assets/config.json`, so updates no longer wipe language, theme and Discord Rich Presence settings
+* Leaderboard validates the filter selection and HTML-escapes its output
+* yt-dlp downloads use collision-safe output names; wget/curl model downloads get timeouts, retries and partial-file cleanup
+* `sage_attention` configs fail with a clear error instead of a `NameError` (not supported in the vendored HyperACE build)
+* Misc: Discord Rich Presence starts only when the app actually runs, single-stem None guard, i18n fixes (de_DE, ar_AR, `fr-FR.json` renamed to `fr_FR.json`), i18n scanner compatible with Python 3.12+, Kaggle notebook file-tunnel fix
+
 ## Requirements
 
 ### Hardware Requirements:
